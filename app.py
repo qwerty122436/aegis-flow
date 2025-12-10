@@ -1,135 +1,147 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
+import ccxt
+import smtplib
+from email.mime.text import MIMEText
+from datetime import datetime
 import time
 
 # ==========================================
-# 1. VISUAL CONFIGURATION (The Aesthetic)
+# 1. CONFIGURATION
 # ==========================================
-st.set_page_config(
-    page_title="Aegis Flow",
-    page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Aegis Auto-Bot", page_icon="🛡️", layout="wide")
 
-# Custom CSS for that "Clean Technical" look
 st.markdown("""
 <style>
-    .stApp {
-        background-color: #0e1117;
-        color: #FAFAFA;
-    }
-    .stMetric {
-        background-color: #262730;
-        padding: 15px;
-        border-radius: 5px;
-        border: 1px solid #41444b;
-    }
-    div[data-testid="stSidebar"] {
-        background-color: #262730;
-    }
+    .stApp { background-color: #0e1117; color: #FAFAFA; }
+    .log-box { font-family: 'Courier New', monospace; color: #00f2ff; font-size: 0.9em; }
 </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 2. THE AI SIMULATION ENGINE
-# ==========================================
-def get_mock_data():
-    """Generates fake crypto market data for demonstration"""
-    dates = pd.date_range(end=pd.Timestamp.now(), periods=100, freq='H')
-    prices = np.cumsum(np.random.randn(100)) + 45000  # Random walk around $45k
-    return pd.DataFrame({'timestamp': dates, 'price': prices})
+# Initialize Session State to remember the last email sent
+if 'last_alert' not in st.session_state:
+    st.session_state['last_alert'] = "NONE"
 
-def ai_prediction(mode):
-    """Simulates the AI analyzing the market"""
-    confidence = np.random.randint(40, 95)  # Random confidence 40-95%
-    
-    if mode == "Fortress (Safe)":
-        if confidence > 80:
-            return "BUY", confidence
+# ==========================================
+# 2. EMAIL ENGINE
+# ==========================================
+def send_email(to_email, password, subject, body):
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = to_email
+    msg['To'] = to_email
+
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(to_email, password)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        st.error(f"Email Error: {e}")
+        return False
+
+# ==========================================
+# 3. LIVE MARKET BRAIN
+# ==========================================
+def fetch_and_analyze(symbol):
+    """
+    Connects to Binance, gets data, calculates RSI.
+    """
+    try:
+        exchange = ccxt.binance()
+        # Get last 50 hours of data
+        bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        # Calculate RSI (The Indicator)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        current_price = df['close'].iloc[-1]
+        current_rsi = df['rsi'].iloc[-1]
+        
+        # DECISION LOGIC
+        if current_rsi < 30:
+            return "BUY", current_price, current_rsi
+        elif current_rsi > 70:
+            return "SELL", current_price, current_rsi
         else:
-            return "HOLD", confidence
-    else: # Vanguard (Risk)
-        decision = np.random.choice(["BUY", "SELL", "HOLD"])
-        return decision, confidence
+            return "WAIT", current_price, current_rsi
+            
+    except Exception as e:
+        return "ERROR", 0, 0
 
 # ==========================================
-# 3. SIDEBAR CONTROLS
+# 4. DASHBOARD UI
 # ==========================================
-st.sidebar.title("🛡️ AEGIS FLOW")
-st.sidebar.markdown("---")
+st.sidebar.title("🛡️ AEGIS AUTO-CONFIG")
 
-# The Mode Switcher
-mode = st.sidebar.radio(
-    "Select Operation Mode:",
-    ("Fortress (Safe)", "Vanguard (High Risk)")
-)
+# Credentials
+user_email = st.sidebar.text_input("Gmail Address")
+user_pass = st.sidebar.text_input("App Password", type="password")
 
-st.sidebar.markdown("---")
-st.sidebar.write("### 💳 Wallet Integration")
-st.sidebar.info("Touch 'n Go Gateway: **Active**")
-st.sidebar.text("Balance: $4,250.00 USDT")
+# Target
+symbol = st.sidebar.selectbox("Asset to Watch", ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
+interval = st.sidebar.slider("Scan Interval (Seconds)", 10, 300, 60)
 
-if st.sidebar.button("Request Withdrawal"):
-    st.sidebar.success("Withdrawal request sent to P2P Agent.")
+st.title(f"Aegis Sentinel: {symbol}")
+st.write("System status: **IDLE**")
 
-# ==========================================
-# 4. MAIN DASHBOARD
-# ==========================================
-st.title("Live Market Terminal")
-
-# Top Level Metrics
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric(label="Bitcoin (BTC)", value="$45,230.50", delta="+1.2%")
-with col2:
-    st.metric(label="24h Profit", value="+$124.00", delta="High Risk Mode")
-with col3:
-    status_color = "green" if mode == "Fortress (Safe)" else "orange"
-    st.markdown(f"**System Status:** :{status_color}[ONLINE - {mode}]")
-
-# The Chart
-data = get_mock_data()
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=data['timestamp'], y=data['price'], mode='lines', name='BTC/USDT', line=dict(color='#00f2ff')))
-fig.update_layout(
-    title="Price Action Analysis",
-    paper_bgcolor='#0e1117',
-    plot_bgcolor='#0e1117',
-    font=dict(color='white'),
-    height=400
-)
-st.plotly_chart(fig, use_container_width=True)
+# Placeholders for live updates (so the page doesn't glitch)
+price_metric = st.empty()
+status_metric = st.empty()
+log_area = st.empty()
+chart_area = st.empty()
 
 # ==========================================
-# 5. AI DECISION PANEL
+# 5. THE INFINITE LOOP
 # ==========================================
-st.subheader("🤖 AI Neural Engine Output")
-
-if st.button("Analyze Market Now"):
-    with st.spinner('AI is reading market signals...'):
-        time.sleep(2) # Fake processing time
-        decision, win_prob = ai_prediction(mode)
+if st.sidebar.button("🔴 ACTIVATE SENTINEL", type="primary"):
+    
+    if not user_email or not user_pass:
+        st.error("⚠️ STOP: You must enter your Email and App Password first.")
+        st.stop()
         
-        c1, c2 = st.columns(2)
+    st.toast("Sentinel Active. Do not close this tab.", icon="👁️")
+    
+    logs = []
+    
+    # This loop runs forever until you close the tab
+    while True:
+        # 1. Get Real Data
+        decision, price, rsi = fetch_and_analyze(symbol)
+        timestamp = datetime.now().strftime("%H:%M:%S")
         
-        with c1:
-            st.markdown("#### Suggested Action")
-            if decision == "BUY":
-                st.markdown(f"<h1 style='color: #00ff41;'>BUY LONG</h1>", unsafe_allow_html=True)
-            elif decision == "SELL":
-                st.markdown(f"<h1 style='color: #ff0041;'>SELL SHORT</h1>", unsafe_allow_html=True)
-            else:
-                st.markdown(f"<h1 style='color: #ffd700;'>HOLD POSITIONS</h1>", unsafe_allow_html=True)
+        # 2. Update Dashboard UI
+        price_metric.metric("Live Price", f"${price:,.2f}", f"RSI: {rsi:.1f}")
         
-        with c2:
-            st.markdown("#### Win Probability")
-            st.progress(win_prob / 100)
-            st.markdown(f"## {win_prob}% Confidence")
+        # 3. Check for Signals
+        if decision == "BUY" and st.session_state['last_alert'] != "BUY":
+            # TRIGGER BUY EMAIL
+            status_metric.error(f"🚨 BUY SIGNAL DETECTED AT {timestamp}")
+            email_body = f"Price: ${price}\nRSI: {rsi}\n\nThe asset is OVERSOLD. Price is low. Good time to enter."
+            send_email(user_email, user_pass, f"🚀 BUY ALERT: {symbol}", email_body)
+            st.session_state['last_alert'] = "BUY" # Prevent spamming
+            st.toast("Email Sent!", icon="📧")
+            
+        elif decision == "SELL" and st.session_state['last_alert'] != "SELL":
+            # TRIGGER SELL EMAIL
+            status_metric.success(f"💰 SELL SIGNAL DETECTED AT {timestamp}")
+            email_body = f"Price: ${price}\nRSI: {rsi}\n\nThe asset is OVERBOUGHT. Price is high. Good time to take profits."
+            send_email(user_email, user_pass, f"📉 SELL ALERT: {symbol}", email_body)
+            st.session_state['last_alert'] = "SELL" # Prevent spamming
+            st.toast("Email Sent!", icon="📧")
+            
+        else:
+            status_metric.info(f"Scanning... Market is stable. ({timestamp})")
 
-        if win_prob < 50:
-            st.warning("⚠️ Risk Alert: Probability is low. Trade not recommended.")
-        elif win_prob > 80:
-            st.success("✅ AI Confidence High. Execution authorized.")
+        # 4. Maintain Log
+        log_entry = f"[{timestamp}] Price: ${price:.2f} | RSI: {rsi:.1f} | Action: {decision}"
+        logs.insert(0, log_entry) # Add new log to top
+        log_area.text_area("Live System Logs", "\n".join(logs[:10]), height=200)
+        
+        # 5. Wait for next scan
+        time.sleep(interval)
