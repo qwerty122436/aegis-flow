@@ -6,24 +6,26 @@ import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 import time
+import os
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & STYLING
 # ==========================================
-st.set_page_config(page_title="Aegis 10-Min Bot", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Aegis Pro: Risk & FOMO", page_icon="🧠", layout="wide")
 
-# Custom Styles
 st.markdown("""
 <style>
     .stApp { background-color: #0e1117; color: #FAFAFA; }
     .high-prob { color: #00ff41; font-weight: bold; }
-    .high-risk { color: #ff0041; font-weight: bold; }
+    .missed-gain { color: #facc15; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
-# Session State for Timer
-if 'next_scan' not in st.session_state:
-    st.session_state['next_scan'] = datetime.now()
+# Initialize Session State
+if 'last_fomo_check' not in st.session_state:
+    st.session_state['last_fomo_check'] = datetime.now()
+
+SHADOW_FILE = "shadow_ledger.csv"
 
 # ==========================================
 # 2. EMAIL ENGINE
@@ -40,140 +42,183 @@ def send_email(to_email, password, subject, body):
             server.send_message(msg)
         return True
     except Exception as e:
-        st.error(f"Email Error: {e}")
+        print(f"Email Error: {e}")
         return False
 
 # ==========================================
-# 3. MATH ENGINE (Risk & Probability)
+# 3. SHADOW LEDGER (Tracks Missed Trades)
 # ==========================================
-def calculate_metrics(df):
-    # 1. RSI (Relative Strength Index)
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+def log_shadow_trade(symbol, action, price, prob):
+    """Saves rejected trades to a CSV file"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_row = pd.DataFrame([[timestamp, symbol, action, price, prob]], 
+                           columns=['Time', 'Symbol', 'Action', 'Price', 'Prob'])
     
-    # 2. ATR (Average True Range) for Volatility Risk
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
-    df['atr'] = true_range.rolling(14).mean()
-    
-    return df
+    if not os.path.isfile(SHADOW_FILE):
+        new_row.to_csv(SHADOW_FILE, index=False)
+    else:
+        new_row.to_csv(SHADOW_FILE, mode='a', header=False, index=False)
 
-def analyze_pair(symbol):
+def generate_fomo_report():
+    """Analyzes the shadow ledger to see what we missed"""
+    if not os.path.isfile(SHADOW_FILE):
+        return None
+
+    df = pd.read_csv(SHADOW_FILE)
+    if df.empty: return None
+
+    report = "FOMO REPORT: MISSED OPPORTUNITIES (Last 48h)\n------------------------------------------\n"
+    missed_count = 0
+
+    # Check current prices
+    unique_symbols = df['Symbol'].unique()
+    current_prices = {}
+    
     try:
-        # Fetch live data (1h interval, last 7 days)
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="7d", interval="60m")
+        data = yf.download(list(unique_symbols), period="1d", interval="1m", progress=False)['Close'].iloc[-1]
+        # Handle single vs multiple ticker return formats
+        if len(unique_symbols) == 1:
+            current_prices[unique_symbols[0]] = float(data)
+        else:
+            for sym in unique_symbols:
+                current_prices[sym] = float(data[sym])
+    except:
+        return "Error fetching current prices for report."
+
+    # Calculate "What If" scenarios
+    for index, row in df.iterrows():
+        sym = row['Symbol']
+        entry = row['Price']
+        action = row['Action']
+        curr = current_prices.get(sym, 0)
         
+        if curr == 0: continue
+
+        # Calculate Profit if we had taken the trade
+        profit_pct = 0
+        if action == "BUY":
+            profit_pct = ((curr - entry) / entry) * 100
+        elif action == "SELL":
+            profit_pct = ((entry - curr) / entry) * 100 # Short profit logic
+
+        # Only report if it would have made > 0.5% profit
+        if profit_pct > 0.5:
+            missed_count += 1
+            report += f"[MISSED] {sym} ({action}) | Entry: {entry:.4f} -> Now: {curr:.4f} | Gain: +{profit_pct:.2f}%\n"
+
+    if missed_count == 0:
+        return None # No big missed trades
+    
+    # Clear the file after reporting so we don't repeat old news
+    os.remove(SHADOW_FILE)
+    return report
+
+# ==========================================
+# 4. TRADING BRAIN (RSI + Probability)
+# ==========================================
+def analyze_market(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="14d", interval="60m") # 1-hour candles
         if df.empty: return None
 
-        df = calculate_metrics(df)
+        # RSI Calculation
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
         
-        current_price = df['Close'].iloc[-1]
         rsi = df['rsi'].iloc[-1]
-        atr = df['atr'].iloc[-1]
+        price = df['Close'].iloc[-1]
         
-        # --- PROBABILITY LOGIC ---
-        # RSI < 30 = High Probability of Buy Success
-        # RSI > 70 = High Probability of Sell Success
-        if rsi < 30:
+        # PROBABILITY LOGIC
+        # Extreme RSI means higher probability of reversal
+        prob = 50
+        signal = "WAIT"
+        
+        if rsi < 25:
             signal = "BUY"
-            win_prob = 75 + (30 - rsi) # Example: RSI 20 -> 85% Win Prob
-        elif rsi > 70:
+            prob = 85 # Very High Prob
+        elif rsi < 35:
+            signal = "BUY"
+            prob = 65 # Medium Prob
+        elif rsi > 75:
             signal = "SELL"
-            win_prob = 75 + (rsi - 70) # Example: RSI 80 -> 85% Win Prob
-        else:
-            signal = "WAIT"
-            win_prob = 50 # Coin toss
+            prob = 85 # Very High Prob
+        elif rsi > 65:
+            signal = "SELL"
+            prob = 65 # Medium Prob
             
-        # --- RISK LOGIC ---
-        # Volatility Risk (ATR as % of Price)
-        volatility_pct = (atr / current_price) * 100
-        if volatility_pct > 0.5: 
-            risk_level = "HIGH"
-        elif volatility_pct > 0.2: 
-            risk_level = "MEDIUM"
-        else: 
-            risk_level = "LOW"
-            
-        return {
-            "symbol": symbol,
-            "signal": signal,
-            "price": current_price,
-            "rsi": rsi,
-            "win_prob": min(win_prob, 99), # Cap at 99%
-            "risk": risk_level
-        }
+        return signal, price, rsi, prob
     except:
         return None
 
 # ==========================================
-# 4. DASHBOARD UI
+# 5. DASHBOARD & LOOP
 # ==========================================
-st.sidebar.title("⚡ AEGIS 10-MIN BOT")
-user_email = st.sidebar.text_input("Gmail Address")
+st.sidebar.title("🧠 AEGIS PRO")
+user_email = st.sidebar.text_input("Gmail")
 user_pass = st.sidebar.text_input("App Password", type="password")
+pairs = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "BTC-USD"]
 
-# Multi-Asset Scanner
-pairs = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X"]
-st.title("High-Frequency Forex Scanner")
-
+st.title("Aegis: Probability & FOMO Engine")
 log_box = st.empty()
-timer_box = st.empty()
+countdown_box = st.empty()
 
-# ==========================================
-# 5. THE 10-MINUTE LOOP
-# ==========================================
-if st.sidebar.button("🔴 START 10-MIN CYCLE", type="primary"):
-    if not user_email or not user_pass:
-        st.error("Enter credentials first.")
-        st.stop()
+if st.sidebar.button("🔴 START INTELLIGENCE CYCLE", type="primary"):
+    if not user_email: st.stop()
     
-    st.toast("Cycle Started. Email incoming every 10 mins.", icon="⏳")
+    st.toast("System Active. Monitoring Probability > 70%", icon="📡")
     
     while True:
-        # 1. SCAN ALL PAIRS
-        results = []
+        # --- A. CHECK FOMO REPORT (Every 48 hours) ---
+        time_diff = datetime.now() - st.session_state['last_fomo_check']
+        if time_diff > timedelta(hours=48):
+            st.toast("Generating FOMO Report...", icon="📊")
+            fomo_msg = generate_fomo_report()
+            if fomo_msg:
+                send_email(user_email, user_pass, "📅 AEGIS: 2-Day Missed Opportunities", fomo_msg)
+            st.session_state['last_fomo_check'] = datetime.now()
+
+        # --- B. SCAN MARKETS ---
         for pair in pairs:
-            res = analyze_pair(pair)
-            if res: results.append(res)
+            result = analyze_market(pair)
+            if not result: continue
             
-        # 2. FIND BEST TRADE
-        # Sort by Win Probability (Highest first)
-        results.sort(key=lambda x: x['win_prob'], reverse=True)
-        best_trade = results[0]
-        
-        timestamp = datetime.now().strftime("%H:%M")
-        
-        # 3. DISPLAY ON SCREEN
-        msg = f"[{timestamp}] Best Option: {best_trade['symbol']} | {best_trade['signal']} | Prob: {best_trade['win_prob']:.1f}%"
-        log_box.info(msg)
-        
-        # 4. SEND EMAIL (EVERY 10 MINS)
-        subject = f"⚡ {best_trade['signal']} ALERT: {best_trade['symbol']}"
-        body = f"""
-        AEGIS HF UPDATE ({timestamp})
-        -----------------------------
-        Best Asset: {best_trade['symbol']}
-        Action: {best_trade['signal']}
-        Price: {best_trade['price']:.5f}
-        
-        📊 STATISTICS:
-        Win Probability: {best_trade['win_prob']:.1f}%
-        Risk Level: {best_trade['risk']}
-        RSI: {best_trade['rsi']:.1f}
-        
-         Next scan in 10 minutes...
-        """
-        
-        send_email(user_email, user_pass, subject, body)
-        
-        # 5. COUNTDOWN TIMER (600 seconds)
-        for seconds_left in range(600, 0, -1):
-            timer_box.metric("Next Email In", f"{seconds_left // 60}m {seconds_left % 60}s")
+            signal, price, rsi, prob = result
+            timestamp = datetime.now().strftime("%H:%M")
+            
+            log_msg = f"[{timestamp}] {pair} | {signal} | RSI:{rsi:.0f} | WinProb:{prob}%"
+            
+            # --- C. DECISION TREE ---
+            if prob >= 70 and signal != "WAIT":
+                # SCENARIO 1: HIGH PROBABILITY -> SEND EMAIL IMMEDIATELY
+                log_box.markdown(f"🔥 **ACTION:** {log_msg}")
+                subject = f"🚨 {signal} ALERT: {pair} (Prob: {prob}%)"
+                body = f"""
+                HIGH PROBABILITY TRADE DETECTED
+                -------------------------------
+                Asset: {pair}
+                Action: {signal}
+                Price: {price}
+                RSI: {rsi:.1f} (Extreme)
+                Win Probability: {prob}%
+                
+                Execute immediately.
+                """
+                send_email(user_email, user_pass, subject, body)
+                
+            elif prob >= 50 and signal != "WAIT":
+                # SCENARIO 2: MEDIUM PROBABILITY -> DON'T EMAIL, BUT LOG TO SHADOW LEDGER
+                log_box.info(f"💾 Logged to Shadow Ledger: {log_msg}")
+                log_shadow_trade(pair, signal, price, prob)
+            
+            else:
+                # SCENARIO 3: NO ACTION
+                log_box.text(log_msg)
+
+        # Countdown 10 minutes
+        for i in range(600, 0, -1):
+            countdown_box.metric("Next Scan In", f"{i}s")
             time.sleep(1)
